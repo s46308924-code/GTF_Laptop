@@ -90,28 +90,121 @@ def is_base(c, pct):
 # DATA FETCH
 # ============================================================
 
+# ==================================================
+# ============ CACHE HELPERS =======================
+# ==================================================
+
+def find_data_dir():
+    """Find data/ directory by walking up parent directories."""
+    current = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        data_path = os.path.join(current, "data")
+        if os.path.isdir(data_path):
+            return data_path
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+def safe_filename(symbol):
+    """Convert FYERS symbol to safe filename: NSE:RELIANCE-EQ → NSE_RELIANCE-EQ"""
+    return symbol.replace(":", "_")
+
+def load_cached_data(symbol, timeframe):
+    """Load cached parquet data if available."""
+    data_dir = find_data_dir()
+    if data_dir is None:
+        return None
+    tf_folder = "1D" if timeframe in ["1D", "D"] else "15m"
+    parquet_path = os.path.join(data_dir, tf_folder, f"{safe_filename(symbol)}.parquet")
+    if not os.path.exists(parquet_path):
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception:
+        return None
+
+def save_cached_data(symbol, timeframe, df):
+    """Save data to parquet cache."""
+    data_dir = find_data_dir()
+    if data_dir is None:
+        return
+    tf_folder = "1D" if timeframe in ["1D", "D"] else "15m"
+    folder = os.path.join(data_dir, tf_folder)
+    os.makedirs(folder, exist_ok=True)
+    parquet_path = os.path.join(folder, f"{safe_filename(symbol)}.parquet")
+    try:
+        df.to_parquet(parquet_path)
+    except Exception:
+        pass
+
 def fetch_data(symbol):
-    end = datetime.now().date()
+    end   = datetime.now().date()
     start = end - timedelta(days=HISTORY_YEARS * 365)
+
+    # Step 1: Try cache
+    try:
+        cached = load_cached_data(symbol, TIMEFRAME)
+        if cached is not None and len(cached) > 0:
+            last_date = cached.index[-1].date()
+            if last_date >= end - timedelta(days=1):
+                mask   = (cached.index.date >= start) & (cached.index.date <= end)
+                result = cached.loc[mask].copy()
+                if not result.empty:
+                    result.index = pd.to_datetime(result.index).tz_localize(None)
+                    return result
+            else:
+                fetch_start = last_date + timedelta(days=1)
+                new_dfs = []
+                cur = fetch_start
+                while cur <= end:
+                    cur_end = min(cur + timedelta(days=API_LIMIT), end)
+                    try:
+                        df_new = fetch_historical_data(
+                            symbol, TIMEFRAME,
+                            cur.strftime("%Y-%m-%d"),
+                            cur_end.strftime("%Y-%m-%d"),
+                            ACCESS_TOKEN
+                        )
+                        if df_new is not None and not df_new.empty:
+                            new_dfs.append(df_new)
+                    except Exception:
+                        pass
+                    cur = cur_end + timedelta(days=1)
+                if new_dfs:
+                    df_new    = pd.concat(new_dfs)
+                    df_merged = pd.concat([cached, df_new])
+                    df_merged = df_merged[~df_merged.index.duplicated()]
+                    df_merged.sort_index(inplace=True)
+                    save_cached_data(symbol, TIMEFRAME, df_merged)
+                    mask   = (df_merged.index.date >= start) & (df_merged.index.date <= end)
+                    result = df_merged.loc[mask].copy()
+                    if not result.empty:
+                        result.index = pd.to_datetime(result.index).tz_localize(None)
+                        return result
+    except Exception:
+        pass
+
+    # Step 2: Fallback — fetch from API
     dfs = []
     cur = start
-
     while cur <= end:
         cur_end = min(cur + timedelta(days=API_LIMIT), end)
         try:
             df = fetch_historical_data(
-                symbol, TIMEFRAME,
+                symbol,
+                TIMEFRAME,
                 cur.strftime("%Y-%m-%d"),
                 cur_end.strftime("%Y-%m-%d"),
                 ACCESS_TOKEN
             )
+            if df is not None and not df.empty:
+                dfs.append(df)
         except Exception:
             cur = cur_end + timedelta(days=1)
             continue
-
-        if df is not None and not df.empty:
-            dfs.append(df)
-
         cur = cur_end + timedelta(days=1)
 
     if not dfs:
@@ -121,6 +214,7 @@ def fetch_data(symbol):
     df = df[~df.index.duplicated()]
     df.sort_index(inplace=True)
     df.index = pd.to_datetime(df.index).tz_localize(None)
+    save_cached_data(symbol, TIMEFRAME, df)
     return df
 
 # ============================================================

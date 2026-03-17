@@ -1,0 +1,4 @@
+fyers_apiv3
+pandas
+plotly
+pyarrow

@@ -1,0 +1,12 @@
+# Parquet data cache — do not commit actual data files
+data/1D/*.parquet
+data/15m/*.parquet
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Output files from scanners
+**/output/
+**/charts/
