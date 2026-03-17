@@ -69,27 +69,71 @@ def fyers_symbol(sym):
     return "NSE:NIFTY50-INDEX" if sym == "NIFTY50" else f"NSE:{sym}-EQ"
 
 # ==================================================
+# ============ CACHE HELPERS =======================
+# ==================================================
+
+def find_data_dir():
+    """Find data/ directory by walking up parent directories."""
+    current = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        data_path = os.path.join(current, "data")
+        if os.path.isdir(data_path):
+            return data_path
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+def safe_filename(symbol):
+    """Convert FYERS symbol to safe filename: NSE:RELIANCE-EQ → NSE_RELIANCE-EQ"""
+    return symbol.replace(":", "_")
+
+def load_cached_data(symbol, timeframe):
+    """Load cached parquet data if available."""
+    data_dir = find_data_dir()
+    if data_dir is None:
+        return None
+    tf_folder = "1D" if timeframe in ["1D", "D"] else "15m"
+    parquet_path = os.path.join(data_dir, tf_folder, f"{safe_filename(symbol)}.parquet")
+    if not os.path.exists(parquet_path):
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception:
+        return None
+
+# ==================================================
 # FETCH PRICE DATA
 # ==================================================
 
 def fetch_price_data(symbol, anchor_date):
-
     today = date.today()
-
     start = anchor_date - timedelta(days=2000)
     end   = anchor_date + timedelta(days=2000)
-
     if end > today:
         end = today
     if start < date(2000, 1, 1):
         start = date(2000, 1, 1)
 
+    # Step 1: Try cache
+    try:
+        cached = load_cached_data(symbol, WEEKLY_TF)
+        if cached is not None and len(cached) > 0:
+            mask   = (cached.index.date >= start) & (cached.index.date <= end)
+            result = cached.loc[mask].copy()
+            if not result.empty:
+                result.index = pd.to_datetime(result.index).tz_localize(None)
+                return result
+    except Exception:
+        pass
+
+    # Step 2: Fallback — fetch from API
     dfs = []
     cur = start
-
     while cur <= end:
         cur_end = min(cur + timedelta(days=MAX_DAYS_PER_CALL), end)
-
         df = fetch_historical_data(
             symbol,
             WEEKLY_TF,
@@ -97,10 +141,8 @@ def fetch_price_data(symbol, anchor_date):
             cur_end.strftime("%Y-%m-%d"),
             ACCESS_TOKEN
         )
-
         if df is not None and not df.empty:
             dfs.append(df)
-
         cur = cur_end + timedelta(days=1)
 
     if not dfs:
