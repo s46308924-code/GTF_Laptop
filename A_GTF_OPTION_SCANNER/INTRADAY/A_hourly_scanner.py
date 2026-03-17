@@ -79,12 +79,116 @@ def is_base(c, pct):
 # ===================== DATA FETCH ===========================
 # ============================================================
 
+# ==================================================
+# ============ CACHE HELPERS =======================
+# ==================================================
+
+def find_data_dir():
+    """Find data/ directory by walking up parent directories."""
+    current = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        data_path = os.path.join(current, "data")
+        if os.path.isdir(data_path):
+            return data_path
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+def safe_filename(symbol):
+    """Convert FYERS symbol to safe filename: NSE:RELIANCE-EQ → NSE_RELIANCE-EQ"""
+    return symbol.replace(":", "_")
+
+def load_cached_data(symbol, timeframe):
+    """Load cached parquet data if available."""
+    data_dir = find_data_dir()
+    if data_dir is None:
+        return None
+    tf_folder = "1D" if timeframe in ["1D", "D"] else "15m"
+    parquet_path = os.path.join(data_dir, tf_folder, f"{safe_filename(symbol)}.parquet")
+    if not os.path.exists(parquet_path):
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception:
+        return None
+
+def save_cached_data(symbol, timeframe, df):
+    """Save data to parquet cache."""
+    data_dir = find_data_dir()
+    if data_dir is None:
+        return
+    tf_folder = "1D" if timeframe in ["1D", "D"] else "15m"
+    folder = os.path.join(data_dir, tf_folder)
+    os.makedirs(folder, exist_ok=True)
+    parquet_path = os.path.join(folder, f"{safe_filename(symbol)}.parquet")
+    try:
+        df.to_parquet(parquet_path)
+    except Exception:
+        pass
+
 def fetch_data(symbol):
-    end = datetime.now().date()
+    end   = datetime.now().date()
     start = end - timedelta(days=HISTORY_YEARS * 365)
+
+    # Step 1: Try 15m cache → resample to 75-minute candles
+    try:
+        cached_15m = load_cached_data(symbol, "15")
+        if cached_15m is not None and len(cached_15m) > 0:
+            last_date = cached_15m.index[-1].date()
+            if last_date >= end - timedelta(days=1):
+                mask = (cached_15m.index.date >= start) & (cached_15m.index.date <= end)
+                df_15m = cached_15m.loc[mask].copy()
+                df_15m.index = pd.to_datetime(df_15m.index).tz_localize(None)
+            else:
+                fetch_start = last_date + timedelta(days=1)
+                new_dfs = []
+                cur = fetch_start
+                while cur <= end:
+                    cur_end = min(cur + timedelta(days=API_LIMIT), end)
+                    try:
+                        df_new = fetch_historical_data(
+                            symbol, "15",
+                            cur.strftime("%Y-%m-%d"),
+                            cur_end.strftime("%Y-%m-%d"),
+                            ACCESS_TOKEN
+                        )
+                        if df_new is not None and not df_new.empty:
+                            new_dfs.append(df_new)
+                    except Exception:
+                        pass
+                    cur = cur_end + timedelta(days=1)
+                if new_dfs:
+                    df_new    = pd.concat(new_dfs)
+                    df_merged = pd.concat([cached_15m, df_new])
+                    df_merged = df_merged[~df_merged.index.duplicated()]
+                    df_merged.sort_index(inplace=True)
+                    save_cached_data(symbol, "15", df_merged)
+                    mask  = (df_merged.index.date >= start) & (df_merged.index.date <= end)
+                    df_15m = df_merged.loc[mask].copy()
+                    df_15m.index = pd.to_datetime(df_15m.index).tz_localize(None)
+                else:
+                    mask  = (cached_15m.index.date >= start) & (cached_15m.index.date <= end)
+                    df_15m = cached_15m.loc[mask].copy()
+                    df_15m.index = pd.to_datetime(df_15m.index).tz_localize(None)
+            if not df_15m.empty:
+                df_75m = df_15m.resample("75min").agg({
+                    "open":   "first",
+                    "high":   "max",
+                    "low":    "min",
+                    "close":  "last",
+                    "volume": "sum"
+                }).dropna()
+                if not df_75m.empty:
+                    return df_75m
+    except Exception:
+        pass
+
+    # Step 2: Fallback — fetch 60-minute data directly from API
     dfs = []
     cur = start
-
     while cur <= end:
         cur_end = min(cur + timedelta(days=API_LIMIT), end)
         try:
